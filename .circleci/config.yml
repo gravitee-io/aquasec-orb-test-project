@@ -1,0 +1,169 @@
+version: 2.1
+
+orbs:
+  gravitee: gravitee-io/gravitee@4.7.2
+  keeper: gravitee-io/keeper@0.6.3
+  aquasec: gravitee-io/aquasec@dev:alpha
+
+commands:
+  enable-corepack:
+    steps:
+      - run:
+          name: Enable Corepack
+          command: sudo corepack enable
+  create-docker-context:
+    steps:
+      - run:
+          name: Create docker context for buildx
+          command: |-
+            docker context create tls-env
+            docker buildx create tls-env --use
+  docker-azure-login:
+    steps:
+      - keeper/env-export:
+          secret-url: keeper://Q721P2LSOPJ9qiXLuf5AHQ/field/login
+          var-name: AZURE_DOCKER_REGISTRY_USERNAME
+      - keeper/env-export:
+          secret-url: keeper://Q721P2LSOPJ9qiXLuf5AHQ/field/password
+          var-name: AZURE_DOCKER_REGISTRY_PASSWORD
+      - run:
+          name: Login to Azure Container Registry
+          command: echo $AZURE_DOCKER_REGISTRY_PASSWORD | docker login --username $AZURE_DOCKER_REGISTRY_USERNAME --password-stdin graviteeio.azurecr.io
+    description: Login to Azure Container Registry
+  docker-azure-logout:
+    steps:
+      - run:
+          name: Logout from Azure Container Registry
+          command: docker logout graviteeio.azurecr.io
+    description: Logout from Azure Container Registry
+
+executors:
+  base:
+    docker:
+      - image: cimg/base:stable
+  node:
+    docker:
+      - image: cimg/node:22.10.0
+
+jobs:
+  install:
+    executor:
+      name: node
+    resource_class: small
+    steps:
+      - checkout
+      - enable-corepack
+      - restore_cache:
+          name: Restore yarn cache
+          keys:
+            - aquasec-orb-test-project-yarn-cache-v1-{{ checksum "yarn.lock" }}
+      - run:
+          name: Install dependencies
+          command: yarn install
+      - save_cache:
+          name: Save yarn cache
+          key: aquasec-orb-test-project-yarn-cache-v1-{{ checksum "yarn.lock" }}
+          paths:
+            - .yarn/cache
+          when: always
+      - persist_to_workspace:
+          root: .
+          paths:
+            - node_modules
+
+  build:
+    executor:
+      name: node
+    steps:
+      - checkout
+      - attach_workspace:
+          at: .
+      - enable-corepack
+      - run:
+          name: Build
+          command: yarn build
+      - persist_to_workspace:
+          root: .
+          paths:
+            - dist
+
+workflows:
+  version: 2
+  branch_validate:
+    jobs:
+      - install
+      - build:
+          requires:
+            - install
+      - gravitee/common_docker_build:
+          name: Build Docker image
+          requires:
+            - build
+          dockerImage: aquasec-orb-test-project
+          dockerTag: main
+          dockerBuildPath: ./
+          registry: graviteeio.azurecr.io
+          username: keeper://Q721P2LSOPJ9qiXLuf5AHQ/field/login
+          password: keeper://Q721P2LSOPJ9qiXLuf5AHQ/field/password
+          saveInWorkspace: true
+          context: cicd-orchestrator
+      - aquasec/fs_scan:
+          requires:
+            - install
+          context: cicd-orchestrator
+          pre-steps:
+            - keeper/env-export:
+                secret-url: keeper://QeHHkvALPob4pgs1hMd9Gw/custom_field/API Key
+                var-name: AQUA_KEY
+            - keeper/env-export:
+                secret-url: keeper://QeHHkvALPob4pgs1hMd9Gw/custom_field/Secret
+                var-name: AQUA_SECRET
+            - keeper/env-export:
+                secret-url: keeper://TIlcGPFq4rN5GvgnZb9hng/field/password
+                var-name: GITHUB_TOKEN
+      - aquasec/register_artifact:
+          requires:
+            - Build Docker image
+          context: cicd-orchestrator
+          built_docker_image_file: /tmp/workspace/built-docker-images.txt
+          pre-steps:
+            - attach_workspace:
+                at: /tmp/workspace
+            - setup_remote_docker:
+                version: default
+            - keeper/env-export:
+                secret-url: keeper://QeHHkvALPob4pgs1hMd9Gw/custom_field/API Key
+                var-name: AQUA_KEY
+            - keeper/env-export:
+                secret-url: keeper://QeHHkvALPob4pgs1hMd9Gw/custom_field/Secret
+                var-name: AQUA_SECRET
+            - keeper/env-export:
+                secret-url: keeper://TIlcGPFq4rN5GvgnZb9hng/field/password
+                var-name: GITHUB_TOKEN
+            - gravitee/docker-load-image-from-workspace:
+                directory: /tmp/workspace
+                filename: spectral-scoring-service
+      - aquasec/docker_image_scan:
+          requires:
+            - Build Docker image
+          context: cicd-orchestrator
+          scanner_url: https://82fb8f75da.cloud.aquasec.com
+          built_docker_image_file: /tmp/workspace/built-docker-images.txt
+          skip_remote_docker_step: true
+          pre-steps:
+            - attach_workspace:
+                at: /tmp/workspace
+            - setup_remote_docker:
+                version: default
+            - keeper/env-export:
+                secret-url: keeper://QeHHkvALPob4pgs1hMd9Gw/custom_field/ScannerToken
+                var-name: SCANNER_TOKEN
+            - keeper/env-export:
+                secret-url: keeper://LYg-wdlM5UDzSqFFH6Kyig/field/login
+                var-name: AQUA_USERNAME
+            - keeper/env-export:
+                secret-url: keeper://LYg-wdlM5UDzSqFFH6Kyig/field/password
+                var-name: AQUA_PASSWORD
+            - gravitee/docker-load-image-from-workspace:
+                directory: /tmp/workspace
+                filename: spectral-scoring-service
